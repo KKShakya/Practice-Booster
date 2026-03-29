@@ -23,8 +23,12 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import ReactMarkdown from 'react-markdown';
+import { GoogleGenAI, Type } from "@google/genai";
 import { cn } from './lib/utils';
 import { Subject, Question, QuestionResult, PerformanceAnalysis, Phase } from './types';
+
+// --- Gemini Initialization ---
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
 
 // --- App Component ---
 
@@ -66,18 +70,46 @@ export default function App() {
     setPhase('parsing');
     
     try {
-      const response = await fetch("/api/parse", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rawInput, subject }),
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: `You are an expert exam paper parser. Parse the following text into a structured JSON array of questions for a ${subject} practice set. 
+        
+        CRITICAL INSTRUCTIONS:
+        1. If the correct answer is not explicitly provided in the text, you MUST solve the question yourself to find the correct answer among the options.
+        2. Ensure "correctAnswer" matches one of the provided options exactly if options exist.
+        3. If no options are provided, provide the numerical or text answer.
+        4. Each question must have a unique "id".
+        5. Extract options into the "options" array if they are present (e.g., (a), (b), (c)...).
+        6. IGNORE any conversational text or instructions at the end of the input that are not part of the questions.
+        7. Clean up any typos in the options (e.g., "No error1" should be "No error").
+        
+        Text to parse:
+        ${rawInput}`,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                id: { type: Type.INTEGER },
+                text: { type: Type.STRING },
+                correctAnswer: { type: Type.STRING },
+                options: { type: Type.ARRAY, items: { type: Type.STRING } }
+              },
+              required: ["id", "text", "correctAnswer"]
+            }
+          }
+        }
       });
 
-      const data = await response.json();
-      
-      if (!response.ok) {
-        throw new Error(data.error || "Failed to parse questions");
+      const text = response.text;
+      if (!text) {
+        throw new Error("AI returned an empty response");
       }
 
+      const data = JSON.parse(text);
+      
       if (!Array.isArray(data) || data.length === 0) {
         throw new Error("No questions could be extracted from the input. Please ensure the text contains clear questions and options.");
       }
@@ -119,7 +151,8 @@ export default function App() {
       timeTaken
     };
 
-    setResults(prev => [...prev, newResult]);
+    const updatedResults = [...results, newResult];
+    setResults(updatedResults);
     setUserAnswers(prev => ({ ...prev, [currentIndex]: answer }));
 
     if (currentIndex < questions.length - 1) {
@@ -127,40 +160,61 @@ export default function App() {
       setCurrentIndex(nextIndex);
       setQuestionStartTimes(prev => ({ ...prev, [nextIndex]: Date.now() }));
     } else {
-      handleFinishPractice();
+      handleFinishPractice(updatedResults);
     }
   };
 
-  const handleFinishPractice = async () => {
+  const handleFinishPractice = async (finalResults?: QuestionResult[]) => {
     setIsTimerActive(false);
     setPhase('analyzing');
     
+    const currentResults = finalResults || results;
+    
     // Calculate basic stats
-    const score = results.filter(r => r.isCorrect).length;
+    const score = currentResults.filter(r => r.isCorrect).length;
     const total = questions.length;
     const accuracy = total > 0 ? (score / total) * 100 : 0;
     const totalTimeUsed = totalTimeLimit - timeLeft;
     const averageSpeed = total > 0 ? totalTimeUsed / total : 0;
 
     try {
-      const response = await fetch("/api/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          questions,
-          results,
-          subject,
-          targetQuestions,
-          score,
-          total,
-          accuracy,
-          averageSpeed
-        }),
+      const prompt = `Analyze this student's performance in a ${subject} practice set.
+      Questions and Answers:
+      ${questions.map((q: any, i: number) => {
+        const res = currentResults.find((r: any) => r.questionId === q.id);
+        return `Q${i+1}: ${q.text}\nCorrect: ${q.correctAnswer}\nUser: ${res?.userAnswer || 'No Answer'}\nCorrect: ${res?.isCorrect}\nTime: ${res?.timeTaken}s`;
+      }).join('\n\n')}
+
+      Total Score: ${score}/${total}
+      Accuracy: ${accuracy.toFixed(2)}%
+      Average Speed: ${averageSpeed.toFixed(2)}s per question
+      Target was: ${targetQuestions} questions.
+
+      Provide:
+      1. A detailed analysis note (motivational but rigorous).
+      2. A specific analysis of speed and time management. Identify which questions took the most time and why (e.g., complex calculation, long reading).
+      3. For English questions: A deep dive into each incorrect answer. Explain the grammatical rule violated (e.g., Subject-Verb Agreement, Tense Consistency, Parallelism, etc.), why the user's choice was incorrect, and the logic behind the correct answer.
+      4. For other subjects: A general analysis of shortcomings and how to improve.
+      
+      Format the response as a JSON object with keys: "detailedNote" (string) and "mistakesAnalysis" (string, markdown supported). "mistakesAnalysis" should include the speed analysis and the subject-specific deep dive.`;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3.1-pro-preview",
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              detailedNote: { type: Type.STRING },
+              mistakesAnalysis: { type: Type.STRING }
+            },
+            required: ["detailedNote", "mistakesAnalysis"]
+          }
+        }
       });
 
-      if (!response.ok) throw new Error("Failed to analyze performance");
-
-      const aiAnalysis = await response.json();
+      const aiAnalysis = JSON.parse(response.text || "{}");
       setAnalysis({
         score,
         total,
@@ -415,7 +469,7 @@ export default function App() {
                 <div className="mt-12 pt-8 border-t border-white/5 flex justify-between items-center">
                   <p className="text-white/20 text-xs font-bold uppercase tracking-widest">Focused Mode Active</p>
                   <button 
-                    onClick={handleFinishPractice}
+                    onClick={() => handleFinishPractice()}
                     className="text-white/40 hover:text-white transition-colors text-xs font-bold uppercase tracking-widest flex items-center gap-2"
                   >
                     End Session Early <XCircle className="w-4 h-4" />
