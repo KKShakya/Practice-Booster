@@ -72,19 +72,26 @@ export default function App() {
         body: JSON.stringify({ rawInput, subject }),
       });
 
-      if (!response.ok) throw new Error("Failed to parse questions");
+      const data = await response.json();
+      
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to parse questions");
+      }
 
-      const parsedQuestions = await response.json();
-      setQuestions(parsedQuestions);
+      if (!Array.isArray(data) || data.length === 0) {
+        throw new Error("No questions could be extracted from the input. Please ensure the text contains clear questions and options.");
+      }
+
+      setQuestions(data);
       setPhase('practice');
       setTimeLeft(totalTimeLimit);
       setIsTimerActive(true);
       setCurrentIndex(0);
       setQuestionStartTimes({ 0: Date.now() });
-    } catch (error) {
+    } catch (error: any) {
       console.error("Parsing error:", error);
       setPhase('setup');
-      alert("Failed to parse questions. Please check your input format.");
+      alert(error.message || "Failed to parse questions. Please check your input format.");
     }
   };
 
@@ -93,7 +100,17 @@ export default function App() {
     const startTime = questionStartTimes[currentIndex];
     const timeTaken = Math.round((now - startTime) / 1000);
 
-    const isCorrect = answer.trim().toLowerCase() === questions[currentIndex].correctAnswer.trim().toLowerCase();
+    // Robust normalization for comparison
+    const normalize = (s: string) => {
+      if (!s) return "";
+      return s.trim()
+        .toLowerCase()
+        .replace(/^[a-e][\)\.]\s*/, '') // Remove a) or a.
+        .replace(/^\([a-e]\)\s*/, '')   // Remove (a)
+        .trim();
+    };
+
+    const isCorrect = normalize(answer) === normalize(questions[currentIndex].correctAnswer);
     
     const newResult: QuestionResult = {
       questionId: questions[currentIndex].id,
